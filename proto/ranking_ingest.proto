@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+// ============================================================================
+// Ranking 内部摄入契约（v0）：与对外读接口（ranking.v1.RankingService）分离。
+// ----------------------------------------------------------------------------
+// 约定：所有「服务间内部调用」的 gRPC 接口统一置于 v0 包（ranking.v0.*），
+// 与对外 C 端接口（v1/v2）在命名与部署上彻底隔离：
+//   - 公网网关（Gateway）按 DeriveGRPCService 仅代理 *.v1.* 服务，v0 天然不进公网入口；
+//   - v0 仅由内网服务经 Consul 直连 gRPC 调用，完全信任内网、不做应用层鉴权，
+//     安全性依赖 gRPC 端口仅对内网开放（不暴露公网）。
+// ============================================================================
+
+package ranking.v0;
+
+option go_package = "github.com/mysunshines/blog-ranking/proto/pb/v0";
+
+// 复用 ranking.proto（package ranking.v1）中已定义的消息类型，避免重复定义。
+import "ranking.proto";
+
+// RankingService 内部摄入接口（ranking.v0，仅内网、仅受信服务）：
+// 业务方（article/comment/user）推送分数变更 + 声明榜单展示配置。
+service RankingService {
+  // 推送分数变更（增量或绝对值）。
+  rpc RecordScore(ranking.v1.RecordScoreRequest) returns (ranking.v1.RecordScoreResponse);
+  // 批量覆盖设置榜单分数（历史回填等一次性全量摄入场景）。
+  // prune_others=true 时移除快照中已不存在的成员（如粉丝归零的用户），仅当 batch 为完整快照时开启。
+  rpc BatchSetScore(ranking.v1.BatchSetScoreRequest) returns (ranking.v1.BatchSetScoreResponse);
+  // 业务方注册榜单配置：声明如何展示该 board（decorator）+ 是否跳转（link_template）。
+  // ranking-service 仅按配置行事，新增任何榜单都无需改动核心代码。
+  rpc RegisterBoard(ranking.v1.RegisterBoardRequest) returns (ranking.v1.RegisterBoardResponse);
+}

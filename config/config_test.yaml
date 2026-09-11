@@ -1,0 +1,78 @@
+# ============================================================
+# ranking-service 配置（Docker test 环境）
+# 基础设施地址指向 docker 网络内服务名（mysql / redis / consul）。
+# 与 development 的差异仅在于地址，段落结构保持一致。
+# ============================================================
+
+app:
+  name: "ranking-service"
+  env: "test"
+  log_level: "debug"
+
+grpc:
+  host: "0.0.0.0"
+  port: 9106
+
+http:
+  host: "0.0.0.0"
+  port: 8086
+
+database:
+  host: "mysql"
+  port: 3306
+  user: "root"
+  password: "root123"
+  name: "blog"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 3600
+
+redis:
+  host: "redis"
+  port: 6379
+  password: ""
+  db: 0
+  pool_size: 100
+
+jwt:
+  secret: "test-secret-key-do-not-use-in-production"
+  expire_time: 604800
+
+consul:
+  address: "consul:8500"
+  check_interval: 10
+  deregister_critical: 30
+
+metrics:
+  enabled: true
+  path: "/metrics"
+  port: 9097
+
+rate_limit:
+  enabled: true
+  qps: 2000
+  burst: 4000
+
+server:
+  grpc:
+    default_timeout_sec: 10
+    max_connection_idle_sec: 60
+    max_connection_age_sec: 120
+    max_connection_age_grace_sec: 30
+    min_ping_interval_sec: 30
+    max_concurrent_streams: 100
+  http:
+    read_timeout_sec: 30
+    read_header_timeout_sec: 10
+    write_timeout_sec: 30
+    idle_timeout_sec: 120
+    default_timeout_sec: 30
+
+loki:
+  enabled: false
+  url: "http://loki:3100/loki/api/v1/push"
+  tenant_id: ""
+
+otel:
+  enabled: false
+  endpoint: "otel-collector:4317"

@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package ranking.v1;
+
+option go_package = "github.com/mysunshines/blog-ranking/proto/pb/v1";
+
+import "google/protobuf/struct.proto";
+
+// ============================================================================
+// Ranking Service gRPC Contract (source of truth)
+// ----------------------------------------------------------------------------
+// 部署形态：纯 gRPC 服务（默认 gRPC 端口 9106），HTTP 8086 仅承载探针。
+// 前端经 Gateway /api/v1/ranking/* 反射代理访问（方法名由 URL 末段 snake_case 推导）。
+//
+// 设计要点：
+//   - 四个内置榜单（浏览/点赞/评论最多文章、发文最多作者）由 RankingService 周期性
+//     从 blog 库 reconcile 重建 Redis ZSET 得到。
+//   - 读路径统一为 GetRanking：取 TopN 后按 BoardConfig 装饰（remote 回调业务服务的
+//     decorator.v0.Decorate），display 为不透明 Struct、link 由
+//     link_template 渲染。业务方仅需 RecordScore 推送分数 + RegisterBoard 声明展示与跳转，
+//     新增任何榜单都无需改动本服务核心代码。
+//   - 对外读接口（本文件 ranking.v1.RankingService）经 Gateway 反射代理暴露给 C 端；
+//     内部摄入接口（RecordScore/BatchSetScore/RegisterBoard）已拆分到独立的
+//     ranking_ingest.proto（ranking.v0.RankingService），与对外接口在命名/部署上
+//     隔离——Gateway 的 DeriveGRPCService 仅代理 *.v1.*，v0 不会进入公网入口。
+// ============================================================================
+
+// 分数操作类型（RecordScore 使用；消息定义见本文件，摄入服务在 ranking_ingest.proto 复用）
+enum ScoreOp {
+  SCORE_OP_UNSPECIFIED = 0;
+  SCORE_OP_INCREMENT = 1;  // 增量（delta）
+  SCORE_OP_SET = 2;        // 设置绝对值（score）
+}
+
+// RankingService 对外读接口（ranking.v1）：经 Gateway 反射代理暴露给 C 端。
+service RankingService {
+  // 统一取榜：按 board 配置做装饰（member -> display）与跳转渲染，返回业务无关的结构。
+  // GET /api/v1/ranking/get_ranking?board=...&limit=10
+  rpc GetRanking(GetRankingRequest) returns (GetRankingResponse);
+  // 通用：取某 member 在 board 中的排名（1-based，0 表示未上榜）与分数
+  rpc GetRank(GetRankRequest) returns (GetRankResponse);
+  // 通用：取某 member 在 board 中的当前分数
+  rpc GetScore(GetScoreRequest) returns (GetScoreResponse);
+}
+
+message GetRankRequest {
+  string board = 1;   // 榜单键，如 "board:user:fans"
+  string member = 2;  // 榜单成员 = 业务主键字符串（文章/用户 ID 转 string）
+}
+message GetRankResponse {
+  int32 code = 1;      // 0=成功，非 0=失败
+  string message = 2;  // 结果描述
+  int64 rank = 3;     // 1-based；0 表示未上榜
+  double score = 4;    // 当前分数
+}
+
+message GetScoreRequest {
+  string board = 1;   // 榜单键，如 "board:user:fans"
+  string member = 2;  // 榜单成员 = 业务主键字符串（文章/用户 ID 转 string）
+}
+message GetScoreResponse {
+  int32 code = 1;      // 0=成功，非 0=失败
+  string message = 2;  // 结果描述
+  double score = 3;    // 当前分数
+}
+
+message RecordScoreRequest {
+  string board = 1;              // 榜单键，如 "board:user:fans"
+  string member = 2;             // 榜单成员 = 业务主键字符串（文章/用户 ID 转 string）
+  double delta = 3;   // SCORE_OP_INCREMENT 使用
+  double score = 4;   // SCORE_OP_SET 使用
+  ScoreOp op = 5;                // 分数操作类型（见 ScoreOp）
+}
+message RecordScoreResponse {
+  int32 code = 1;      // 0=成功，非 0=失败
+  string message = 2;  // 结果描述
+  double score = 3;    // 操作后的最新分数
+}
+
+// ScoreItem 批量摄入的单项：member + 绝对值分数。
+message ScoreItem {
+  string member = 1;  // 榜单成员 = 业务主键字符串（文章/用户 ID 转 string）
+  double score = 2;   // 绝对值分数
+}
+
+message BatchSetScoreRequest {
+  string board = 1;              // 榜单键
+  repeated ScoreItem items = 2;  // 待写入的成员与绝对值分数
+  bool prune_others = 3;         // true=移除 ZSET 中不在 items 内的旧成员（完整快照回填时开启）
+}
+
+message BatchSetScoreResponse {
+  int32 code = 1;      // 0=成功，非 0=失败
+  string message = 2;  // 结果描述
+  int64 count = 3;  // 成功写入的成员数
+}
+
+// --------------------------- 统一榜单（业务无关） ---------------------------
+
+// BoardConfig 由业务方通过 RegisterBoard 注册，声明该 board 如何展示与是否可跳转。
+// ranking-service 仅按配置行事，不感知任何业务字段，新增榜单无需改动核心代码。
+message BoardConfig {
+  string board = 1;              // 榜单键，如 "board:user:fans"
+  string decorator_type = 2;    // 固定 "remote"：回调业务服务（实现 decorator.v0.Decorator）
+  string decorator_service = 4; // decorator_type=remote 时：consul 服务名，如 "article-service"
+  string decorator_method = 5;  // decorator_type=remote 时：方法名，默认 "Decorate"
+  string link_template = 6;     // 跳转模板，如 "/space/{member}"；空=不跳转
+  int32  cache_ttl_sec = 7;     // 富化结果缓存秒数，<=0 用默认
+}
+
+// RankItem 业务无关的榜单条目：member 为业务 ID，display 为不透明展示结构，link 为跳转链接。
+message RankItem {
+  string member = 1;                     // 业务主键字符串（文章/用户 ID 转 string）
+  double score = 2;                      // 该成员当前分数
+  int64  rank = 3;                       // 1-based；0 表示未上榜
+  google.protobuf.Struct display = 4;    // 不透明展示结构（来自 decorator，ranking 透传）
+  string link = 5;                       // 已渲染的跳转链接（空=不跳转）
+}
+
+message RegisterBoardRequest {
+  BoardConfig config = 1;
+}
+message RegisterBoardResponse {
+  int32 code = 1;      // 0=成功，非 0=失败
+  string message = 2;  // 结果描述
+}
+
+message GetRankingRequest {
+  string board = 1;   // 榜单键，如 "board:user:fans"
+  int32 limit = 2;    // 返回条数上限（默认 10，最大 100）
+}
+message GetRankingResponse {
+  int32 code = 1;              // 0=成功，非 0=失败
+  string message = 2;          // 结果描述
+  repeated RankItem items = 3; // 榜单条目列表（含展示信息与跳转链接）
+}

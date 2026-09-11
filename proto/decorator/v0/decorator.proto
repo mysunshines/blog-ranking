@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package decorator.v0;
+
+option go_package = "github.com/mysunshines/blog-ranking/proto/decorator/v0/pb";
+
+import "google/protobuf/struct.proto";
+
+// ============================================================================
+// Decorator Contract (shared, source of truth)
+// ----------------------------------------------------------------------------
+// 业务服务实现 Decorator，把一批 member（业务 ID 字符串）装饰为「展示信息」。
+// ranking-service 在 GetRanking 时按 board 配置回调，自身不感知任何业务字段——
+// display 为 google.protobuf.Struct（不透明结构），由实现方自由定义键值。
+//
+// 部署形态：ranking-service 通过 consul 服务发现解析 decorator_service（如
+// "user-service"），再调用 /decorator.v0.Decorator/Decorate。各业务服务在自身
+// gRPC Server 上注册 decorator.v0.Decorator 即可，无需改动 ranking-service。
+//
+// 版本约定：Decorator 与摄入接口同属纯内部服务间调用，故置于 v0 包，与对外
+// v1/v2 在命名与部署上隔离（见 ranking.v0 摄入接口约定）。
+// ============================================================================
+
+service Decorator {
+  // Decorate 批量将 members 转为展示信息。返回的 map key 必须与入参 member 一致。
+  rpc Decorate(DecorateRequest) returns (DecorateResponse);
+}
+
+message DecorateRequest {
+  repeated string members = 1;
+}
+
+message DecorateResponse {
+  // key = member 字符串；value = 不透明展示结构（业务自定义字段，ranking-service 透传）。
+  map<string, google.protobuf.Struct> display = 1;
+}
