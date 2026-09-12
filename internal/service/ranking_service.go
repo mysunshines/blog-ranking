@@ -10,6 +10,7 @@ import (
 	"github.com/mysunshines/blog-ranking/internal/boardconfig"
 	"github.com/mysunshines/blog-ranking/internal/constants"
 	"github.com/mysunshines/blog-ranking/internal/decorator"
+	"github.com/mysunshines/blog-ranking/internal/metrics"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/mysunshines/gocommon/cache"
@@ -188,9 +189,23 @@ func (s *rankingService) GetRanking(ctx context.Context, board string, limit int
 
 	var linkTmpl string
 	display := map[string]map[string]interface{}{}
-	if c, found, err := s.boardStore.Get(ctx, board); err == nil && found {
+	c, found, err := s.boardStore.Get(ctx, board)
+	switch {
+	case err != nil:
+		// 配置读取失败（如 Redis 不可用）：退化为纯 member+score，仅告警不影响主流程。
+		log.Warnf("[ranking] load board config failed for %s: %v (degraded: no display/link)", board, err)
+	case found:
 		linkTmpl = c.LinkTemplate
 		display = s.decorate(ctx, c, members)
+	default:
+		// 配置未注册。若该 board 已有分数，说明配置曾存在而后丢失（Redis 数据丢失或
+		// 业务方注册失败）——必须告警：此时接口仍返回 200，前端只是"少了标题和跳转"，
+		// 若不打点几乎无法发现。
+		// 反之若连分数都没有，视为尚未接入的 board（如只需 ID+分数的积分榜），
+		// 属预期行为，静默跳过，避免误告警。
+		if len(scores) > 0 {
+			metrics.RecordBoardConfigMissing(board)
+		}
 	}
 
 	out := make([]GenericRankItem, 0, len(scores))
