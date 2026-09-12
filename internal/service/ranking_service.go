@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,8 +48,10 @@ type RankingService interface {
 	GetScore(ctx context.Context, board, member string) (float64, error)
 	RecordScore(ctx context.Context, board, member string, delta, score float64, op int) (float64, error)
 	// BatchSetScore 批量覆盖设置榜单分数（单次 ZAdd 多成员），用于历史回填。
-	// pruneOthers=true 时移除 ZSET 中不在 items 内的旧成员，仅当 batch 为完整快照时开启。返回写入成员数。
-	BatchSetScore(ctx context.Context, board string, items []ScoreItem, pruneOthers bool) (int64, error)
+	// pruneOthers=true 时移除 ZSET 中不在 items 内的旧成员，仅当 batch 为完整快照时开启。
+	// skipNewerThan 为快照时间（Unix 毫秒，回填场景必填）：>0 时开启「不回退」保护，
+	// 跳过「最后更新时间晚于它」的成员并保守 prune，详见实现处注释。返回写入成员数。
+	BatchSetScore(ctx context.Context, board string, items []ScoreItem, pruneOthers bool, skipNewerThan int64) (int64, error)
 
 	// 统一榜单（业务无关） ----------------------------------------------------
 	// RegisterBoard 注册/覆盖某 board 的展示配置（decorator + 跳转模板）。
@@ -103,20 +106,41 @@ func (s *rankingService) GetScore(ctx context.Context, board, member string) (fl
 
 // RecordScore 通用分数摄入：INCREMENT 走 ZIncrBy，SET 走 ZAdd 绝对值。
 // 用于积分榜/粉丝榜等「纯推送」的榜单（ranking-service 不读业务库）。
+//
+// 写入成功后记录该 member 的最后更新时间，供 BatchSetScore 的「不回退」保护判断。
 func (s *rankingService) RecordScore(ctx context.Context, board, member string, delta, score float64, op int) (float64, error) {
 	if cache.GetClient() == nil {
 		return 0, fmt.Errorf("redis not initialized")
 	}
 	switch op {
 	case OpIncrement:
-		return cache.ZIncrBy(ctx, board, delta, member)
+		newScore, err := cache.ZIncrBy(ctx, board, delta, member)
+		if err != nil {
+			return 0, err
+		}
+		s.touchMember(ctx, board, member)
+		return newScore, nil
 	case OpSet:
 		if _, err := cache.ZAdd(ctx, board, &redis.Z{Score: score, Member: member}); err != nil {
 			return 0, err
 		}
+		s.touchMember(ctx, board, member)
 		return score, nil
 	default:
 		return 0, fmt.Errorf("unknown score op: %d", op)
+	}
+}
+
+// touchMember 记录 board 内某 member 的最后更新时间（Unix 毫秒）到 Redis Hash
+// （ranking:board:updated:<board>，field=member，value=毫秒时间戳）。
+//
+// 用途：回填（BatchSetScore）时携带快照时间，跳过「比快照更新」的成员，
+// 避免用旧快照覆盖掉快照之后发生的增量（否则榜单分数会回退一个回填周期）。
+// best-effort：写入失败仅告警，最坏退化为"可能被覆盖"的旧行为，不影响分数写入。
+func (s *rankingService) touchMember(ctx context.Context, board, member string) {
+	key := constants.RedisKeyPrefixRanking + constants.RedisKeyBoardUpdated + board
+	if _, err := cache.HSet(ctx, key, member, time.Now().UnixMilli()); err != nil {
+		log.Warnf("[ranking] record member updated time failed: board=%s member=%s: %v", board, member, err)
 	}
 }
 
@@ -124,48 +148,107 @@ func (s *rankingService) RecordScore(ctx context.Context, board, member string, 
 // 用于历史回填等一次性全量摄入，比逐条 RecordScore(op=SET) 少 N-1 次网络往返。
 // pruneOthers=true 时移除 ZSET 中不在 items 内的旧成员（如粉丝归零的用户），
 // 仅当 items 为该 board 的完整快照时开启，否则会误删其他成员。返回成功写入的成员数。
-func (s *rankingService) BatchSetScore(ctx context.Context, board string, items []ScoreItem, pruneOthers bool) (int64, error) {
+//
+// skipNewerThan 是「快照时间」（Unix 毫秒，即开始读 DB 快照的时刻）。>0 时开启
+// 「不回退」保护，解决全量覆盖与增量推送的竞态：
+//  1. 跳过「最后更新时间 > 快照时间」的成员——它们在快照生成之后又有增量变更，
+//     用旧快照覆盖会让分数回退（如快照读到浏览 100，期间 +1 变 101，回填写 100 就丢了 +1）；
+//  2. prune 时同样跳过这类成员——快照之后才新增的成员（回填开始后发布的文章）
+//     不在快照里，若不跳过就会被误删。
+//
+// 传 0 则保持原有「全量覆盖」语义（适合人工校正等确实需要强制覆盖的场景）。
+func (s *rankingService) BatchSetScore(ctx context.Context, board string, items []ScoreItem, pruneOthers bool, skipNewerThan int64) (int64, error) {
 	if cache.GetClient() == nil {
 		return 0, fmt.Errorf("redis not initialized")
 	}
+	updatedKey := constants.RedisKeyPrefixRanking + constants.RedisKeyBoardUpdated + board
+
+	// 保护模式下取「member -> 最后更新时间」全量映射。读取失败不阻断，退化为全量覆盖。
+	var updated map[string]string
+	if skipNewerThan > 0 {
+		var err error
+		updated, err = cache.HGetAll(ctx, updatedKey)
+		if err != nil {
+			log.Warnf("[ranking] read member updated times failed for board=%s: %v (fallback to full overwrite)", board, err)
+			updated = nil
+		}
+	}
+
+	// keep 记录快照中出现过的全部 member（含本轮被跳过的），prune 时据此保留，
+	// 否则被跳过的成员会因为不在 zs 里而被当作"陈旧成员"删除。
+	keep := make(map[string]struct{}, len(items))
 	zs := make([]*redis.Z, 0, len(items))
+	skipped := 0
 	for _, it := range items {
 		if it.Member == "" {
+			continue
+		}
+		keep[it.Member] = struct{}{}
+		if skipNewerThan > 0 && updated != nil && newerThan(updated[it.Member], skipNewerThan) {
+			// 快照之后又有增量变更：保留 ZSET 中较新的值，不回退。
+			skipped++
 			continue
 		}
 		zs = append(zs, &redis.Z{Score: it.Score, Member: it.Member})
 	}
 	if len(zs) == 0 {
+		if skipped > 0 {
+			log.Infof("[ranking] backfill board=%s: skipped all %d members (updated after snapshot)", board, skipped)
+		}
 		return 0, nil
 	}
 	if _, err := cache.ZAdd(ctx, board, zs...); err != nil {
 		return 0, err
 	}
+
 	if pruneOthers {
 		// 移除快照中已不存在的成员（与 ZAdd 后 ZRem 的清理逻辑一致）。
 		old, err := cache.ZRange(ctx, board, 0, -1)
 		if err != nil {
 			return int64(len(zs)), err
 		}
-		keep := make(map[string]struct{}, len(zs))
-		for _, z := range zs {
-			if m, ok := z.Member.(string); ok {
-				keep[m] = struct{}{}
-			}
-		}
-		stale := make([]interface{}, 0, len(old))
+		stale := make([]string, 0)
 		for _, m := range old {
-			if _, ok := keep[m]; !ok {
-				stale = append(stale, m)
+			if _, ok := keep[m]; ok {
+				continue
 			}
+			// 保守 prune：快照之后才新增/更新的成员不删（它们只是还没进快照）。
+			if skipNewerThan > 0 && updated != nil && newerThan(updated[m], skipNewerThan) {
+				continue
+			}
+			stale = append(stale, m)
 		}
 		if len(stale) > 0 {
-			if _, err := cache.ZRem(ctx, board, stale...); err != nil {
+			rem := make([]interface{}, 0, len(stale))
+			for _, m := range stale {
+				rem = append(rem, m)
+			}
+			if _, err := cache.ZRem(ctx, board, rem...); err != nil {
 				return int64(len(zs)), err
+			}
+			// 同步清理更新时间记录，避免该 Hash 随成员删除而无限增长。
+			if _, err := cache.HDel(ctx, updatedKey, stale...); err != nil {
+				log.Warnf("[ranking] clean member updated times failed for board=%s: %v", board, err)
 			}
 		}
 	}
+	if skipped > 0 {
+		log.Infof("[ranking] backfill board=%s: wrote %d, skipped %d (updated after snapshot)", board, len(zs), skipped)
+	}
 	return int64(len(zs)), nil
+}
+
+// newerThan 判断成员的最后更新时间是否晚于快照时间。
+// 时间戳为空或解析失败时返回 false（视为"无更新记录"，按可覆盖处理）。
+func newerThan(ts string, snapshotMs int64) bool {
+	if ts == "" {
+		return false
+	}
+	t, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return false
+	}
+	return t > snapshotMs
 }
 
 // RegisterBoard 注册/覆盖某 board 的展示配置（持久化于 Redis，动态生效）。

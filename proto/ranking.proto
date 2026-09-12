@@ -87,6 +87,13 @@ message BatchSetScoreRequest {
   string board = 1;              // 榜单键
   repeated ScoreItem items = 2;  // 待写入的成员与绝对值分数
   bool prune_others = 3;         // true=移除 ZSET 中不在 items 内的旧成员（完整快照回填时开启）
+  // 快照时间（Unix 毫秒），回填场景应填写"开始读 DB 快照的时刻"。
+  // >0 时启用「不回退」保护：
+  //   - 只覆盖「最后更新时间 <= 该值」的成员，跳过在快照之后又发生过增量变更的成员，
+  //     避免用旧快照覆盖掉更新的增量（否则榜单分数会回退一个回填周期）；
+  //   - prune_others 同时只清理「该时间之前无更新」的成员，避免误删快照之后新增的成员。
+  // 不传（0）则保持原有全量覆盖语义。
+  int64 skip_newer_than = 4;
 }
 
 message BatchSetScoreResponse {

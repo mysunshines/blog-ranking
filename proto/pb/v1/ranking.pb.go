@@ -494,10 +494,18 @@ func (x *ScoreItem) GetScore() float64 {
 }
 
 type BatchSetScoreRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Board         string                 `protobuf:"bytes,1,opt,name=board,proto3" json:"board,omitempty"`                                 // 榜单键
-	Items         []*ScoreItem           `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`                                 // 待写入的成员与绝对值分数
-	PruneOthers   bool                   `protobuf:"varint,3,opt,name=prune_others,json=pruneOthers,proto3" json:"prune_others,omitempty"` // true=移除 ZSET 中不在 items 内的旧成员（完整快照回填时开启）
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Board       string                 `protobuf:"bytes,1,opt,name=board,proto3" json:"board,omitempty"`                                 // 榜单键
+	Items       []*ScoreItem           `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`                                 // 待写入的成员与绝对值分数
+	PruneOthers bool                   `protobuf:"varint,3,opt,name=prune_others,json=pruneOthers,proto3" json:"prune_others,omitempty"` // true=移除 ZSET 中不在 items 内的旧成员（完整快照回填时开启）
+	// 快照时间（Unix 毫秒），回填场景应填写"开始读 DB 快照的时刻"。
+	// >0 时启用「不回退」保护：
+	//   - 只覆盖「最后更新时间 <= 该值」的成员，跳过在快照之后又发生过增量变更的成员，
+	//     避免用旧快照覆盖掉更新的增量（否则榜单分数会回退一个回填周期）；
+	//   - prune_others 同时只清理「该时间之前无更新」的成员，避免误删快照之后新增的成员。
+	//
+	// 不传（0）则保持原有全量覆盖语义。
+	SkipNewerThan int64 `protobuf:"varint,4,opt,name=skip_newer_than,json=skipNewerThan,proto3" json:"skip_newer_than,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -551,6 +559,13 @@ func (x *BatchSetScoreRequest) GetPruneOthers() bool {
 		return x.PruneOthers
 	}
 	return false
+}
+
+func (x *BatchSetScoreRequest) GetSkipNewerThan() int64 {
+	if x != nil {
+		return x.SkipNewerThan
+	}
+	return 0
 }
 
 type BatchSetScoreResponse struct {
@@ -1017,11 +1032,12 @@ const file_ranking_proto_rawDesc = "" +
 	"\x05score\x18\x03 \x01(\x01R\x05score\"9\n" +
 	"\tScoreItem\x12\x16\n" +
 	"\x06member\x18\x01 \x01(\tR\x06member\x12\x14\n" +
-	"\x05score\x18\x02 \x01(\x01R\x05score\"|\n" +
+	"\x05score\x18\x02 \x01(\x01R\x05score\"\xa4\x01\n" +
 	"\x14BatchSetScoreRequest\x12\x14\n" +
 	"\x05board\x18\x01 \x01(\tR\x05board\x12+\n" +
 	"\x05items\x18\x02 \x03(\v2\x15.ranking.v1.ScoreItemR\x05items\x12!\n" +
-	"\fprune_others\x18\x03 \x01(\bR\vpruneOthers\"[\n" +
+	"\fprune_others\x18\x03 \x01(\bR\vpruneOthers\x12&\n" +
+	"\x0fskip_newer_than\x18\x04 \x01(\x03R\rskipNewerThan\"[\n" +
 	"\x15BatchSetScoreResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x14\n" +

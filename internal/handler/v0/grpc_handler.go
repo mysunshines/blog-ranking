@@ -79,7 +79,7 @@ func (h *GrpcRankingHandler) BatchSetScore(ctx context.Context, req *pb.BatchSet
 		}
 		items = append(items, service.ScoreItem{Member: it.Member, Score: it.Score})
 	}
-	n, err := h.Svc.BatchSetScore(ctx, req.Board, items, req.PruneOthers)
+	n, err := h.Svc.BatchSetScore(ctx, req.Board, items, req.PruneOthers, req.SkipNewerThan)
 	if err != nil {
 		return &pb.BatchSetScoreResponse{Code: 2, Message: err.Error()}, nil
 	}

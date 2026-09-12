@@ -11,6 +11,11 @@ const (
 	RedisKeyBoardConfig  = "board:config:"
 	RedisKeyBoardDisplay = "board:display:"
 
+	// RedisKeyBoardUpdated = ranking:board:updated:<board>  （Hash：field=member，value=最后更新毫秒时间戳）
+	// 用于回填的「不回退」保护：回填只覆盖「最后更新时间 <= 快照时间」的成员，
+	// 跳过快照之后又发生过增量变更的成员，避免用旧快照覆盖掉更新的增量。
+	RedisKeyBoardUpdated = "board:updated:"
+
 	// LinkTemplateMemberPlaceholder 跳转模板中的占位符，渲染时替换为具体 member（文章 ID / 用户 ID）。
 	// 与 board config 的 link_template（如 "/article/{member}"）约定逐字符一致，故收敛为常量。
 	LinkTemplateMemberPlaceholder = "{member}"
