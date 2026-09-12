@@ -163,16 +163,15 @@ func (s *rankingService) BatchSetScore(ctx context.Context, board string, items 
 	}
 	updatedKey := constants.RedisKeyPrefixRanking + constants.RedisKeyBoardUpdated + board
 
-	// 保护模式下取「member -> 最后更新时间」全量映射。读取失败不阻断，退化为全量覆盖。
-	var updated map[string]string
-	if skipNewerThan > 0 {
-		var err error
-		updated, err = cache.HGetAll(ctx, updatedKey)
-		if err != nil {
-			log.Warnf("[ranking] read member updated times failed for board=%s: %v (fallback to full overwrite)", board, err)
-			updated = nil
+	// 只取「本次快照涉及的 member」的更新时间，避免 HGetAll 把整个 Hash 拉回来
+	//（该 Hash 随 member 数增长，而回填通常只关心快照里这一批）。
+	itemMembers := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Member != "" {
+			itemMembers = append(itemMembers, it.Member)
 		}
 	}
+	updated := s.memberUpdatedTimes(ctx, updatedKey, itemMembers, skipNewerThan)
 
 	// keep 记录快照中出现过的全部 member（含本轮被跳过的），prune 时据此保留，
 	// 否则被跳过的成员会因为不在 zs 里而被当作"陈旧成员"删除。
@@ -207,13 +206,20 @@ func (s *rankingService) BatchSetScore(ctx context.Context, board string, items 
 		if err != nil {
 			return int64(len(zs)), err
 		}
-		stale := make([]string, 0)
+		// prune 候选：ZSET 中存在、但不在本次快照里的成员。
+		candidates := make([]string, 0, len(old))
 		for _, m := range old {
-			if _, ok := keep[m]; ok {
-				continue
+			if _, ok := keep[m]; !ok {
+				candidates = append(candidates, m)
 			}
+		}
+		// 只查这批候选的更新时间（第二次 HMGET），用于保守 prune 判断。
+		candUpdated := s.memberUpdatedTimes(ctx, updatedKey, candidates, skipNewerThan)
+
+		stale := make([]string, 0, len(candidates))
+		for _, m := range candidates {
 			// 保守 prune：快照之后才新增/更新的成员不删（它们只是还没进快照）。
-			if skipNewerThan > 0 && updated != nil && newerThan(updated[m], skipNewerThan) {
+			if skipNewerThan > 0 && candUpdated != nil && newerThan(candUpdated[m], skipNewerThan) {
 				continue
 			}
 			stale = append(stale, m)
@@ -236,6 +242,23 @@ func (s *rankingService) BatchSetScore(ctx context.Context, board string, items 
 		log.Infof("[ranking] backfill board=%s: wrote %d, skipped %d (updated after snapshot)", board, len(zs), skipped)
 	}
 	return int64(len(zs)), nil
+}
+
+// memberUpdatedTimes 批量读取一批 member 的最后更新时间（毫秒字符串）。
+//
+// 只在开启不回退保护（skipNewerThan > 0）且 members 非空时查询，避免无谓的 Redis
+// 往返。读取失败仅告警并返回 nil——调用方拿到 nil 会退化为"允许覆盖 / 允许删除"
+// 的旧行为，不会阻断回填。
+func (s *rankingService) memberUpdatedTimes(ctx context.Context, updatedKey string, members []string, skipNewerThan int64) map[string]string {
+	if skipNewerThan <= 0 || len(members) == 0 {
+		return nil
+	}
+	updated, err := cache.HMGetMap(ctx, updatedKey, members...)
+	if err != nil {
+		log.Warnf("[ranking] read member updated times failed (key=%s, n=%d): %v", updatedKey, len(members), err)
+		return nil
+	}
+	return updated
 }
 
 // newerThan 判断成员的最后更新时间是否晚于快照时间。
