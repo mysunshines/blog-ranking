@@ -5,83 +5,89 @@
 并通过 `RegisterBoard` 声明该榜单「怎么展示、是否跳转」（详见 §4.1 统一榜单）。
 
 > 模块：`github.com/mysunshines/blog-ranking`（独立 Go module，遵循仓库 tag 引用约定，不依赖本地 replace）。
-> 仅依赖 `github.com/mysunshines/gocommon v1.6.1`（config / cache / consul / database / middleware / observability / metrics / log）。
+> 仅依赖 `github.com/mysunshines/gocommon v1.6.5`（config / cache / consul / middleware / observability / metrics / log）。
+> **不连接业务数据库**：ranking 自身不持有、也不读取 blog 库；榜单状态只存 Redis ZSET，
+> 展示信息由业务服务通过 Decorator 回调提供（见 §4.1）。
 
 ---
 
-## 1. 架构核心：ZSET 实时榜 + reconcile 对账重建
+## 1. 架构核心：ZSET 实时榜 + 业务推送分数
 
 排行榜本质是**有序集合（ZSET）**：`member` 为业务 ID（文章 ID / 用户 ID），`score` 为排序值（浏览数 / 点赞数 / 评论数 / 发文数）。
 
 - **排序与实时性由 Redis ZSET 保证**：`ZREVRANGE` 取 TopN 为 O(log N + M)，天然有序、毫秒级响应。
-- **榜单状态唯一来源是 ZSET**，业务表（blog 库）只作为「权威计数」的读取源，服务对其**只读**。
+- **分数的唯一来源是业务服务推送**（`RecordScore` / `BatchSetScore`），ranking **不计算任何业务分数**。
+- **无 reconcile 对账**：原「周期性从 blog 库全量重算」机制已移除，ranking 不再连接 MySQL（详见 §3）。
 
 ```
-                ┌──────────────┐        周期性 reconcile（默认 30s）
-   blog 库      │  articles    │ ─────────────────────────────┐
- (MySQL,只读)   │  users       │                              │
-                └──────────────┘                              ▼
-                                                        ┌──────────────┐
-                                                        │ Redis ZSET   │  ◀── RecordScore（未来推送）
-                                                        │ ranking:board*│
-                                                        └──────────────┘
-                                                                │ ZREVRANGE
-                                                                ▼
-                                                       读路径：TopN + 装饰（内置回填 / 回调业务）
+   业务服务（article / comment / user）
+     │  RecordScore   （+1/-1，INCREMENT）
+     │  BatchSetScore （历史回填，SET）
+     │  RegisterBoard （声明展示与跳转）
+     │  经 Consul 直连 gRPC：ranking.v0.RankingService
+     ▼
+   ┌──────────────┐
+   │ Redis ZSET   │  ranking:board:<board>
+   └──────────────┘
+     │ ZREVRANGE
+     ▼
+   读路径：GetRanking → TopN + 装饰（remote 回调业务服务）+ 渲染 link
 ```
 
 ### 为什么是 ZSET 而不是每次查 DB 排序？
 - 文章/作者榜是高频读、低频变的场景。`ORDER BY view_count DESC LIMIT 10` 在大表上需全表扫描+排序；
-  ZSET 把排序成本前移到写入/reconcile 阶段，读路径只需 O(log N) 取 TopN，天然支撑高并发。
+  ZSET 把排序成本前移到**写入阶段**，读路径只需 O(log N) 取 TopN，天然支撑高并发。
 
 ---
 
-## 2. 四个内置榜单
+## 2. 当前已接入的四个榜单
 
-| 榜单 | ZSET 键（含前缀 `ranking:`） | score 来源 |
+> **「内置榜单」在 ranking-service 中已不存在**：代码内**不硬编码任何榜单**——无榜单键常量、无预置或兜底逻辑，
+> ranking 是纯通用的排行榜引擎（只负责 ZSET 存分 + 按配置装饰 + 取 TopN）。
+> 下表四个榜是**业务方已接入**的榜单：名称由 `article-service` 定义，配置由 `article/user-service` 注册，
+> 分数由 `article/comment-service` 推送。对 ranking 而言，它们与未来的粉丝榜/积分榜完全等价，均为外部注册的 board。
+
+| 榜单 | ZSET 键（含前缀 `ranking:`） | score 来源（推送方） |
 |---|---|---|
-| 浏览最多文章 | `ranking:board:article:views` | `articles.view_count` |
-| 点赞最多文章 | `ranking:board:article:likes` | `articles.like_count` |
-| 评论最多文章 | `ranking:board:article:comments` | `articles.comment_count` |
-| 发文最多作者 | `ranking:board:author:articles` | `COUNT(*) GROUP BY user_id` |
+| 浏览最多文章 | `ranking:board:article:views` | article-service 推送（浏览 `+1`） |
+| 点赞最多文章 | `ranking:board:article:likes` | article-service 推送（点赞 `+1` / 取消 `-1`） |
+| 评论最多文章 | `ranking:board:article:comments` | comment-service 推送（新增 `+1` / 删除 `-1`） |
+| 发文最多作者 | `ranking:board:author:articles` | article-service 推送（该用户已发布文章数，启动时历史回填） |
 
 - Redis 键前缀统一为 `ranking:`（由 `constants.RedisKeyPrefixRanking` 定义；gocommon `cache.GetKey` 自动拼接）。
-- 仅统计 **`status = 'published' AND deleted_at IS NULL`** 的已发布、未删除文章。
+- **榜单配置由业务方注册**：article-service 启动时 `RegisterBoard` 注册文章三榜（装饰器 = `article-service`），
+  user-service 注册作者榜（装饰器 = `user-service`）；配置存于 Redis，**动态生效、无需重启 ranking**。
+- **业务口径由推送方保证**：例如「仅统计已发布、未删除的文章」，ranking 不感知任何业务规则，
+  只按推送进来的分数排序。
 
 ---
 
-## 3. reconcile 机制（保证 ZSET 与 MySQL 最终一致）
+## 3. 分数摄入与一致性（原 reconcile 已移除）
 
-`RankingService.Reconcile` 周期性（默认 30s，受环境变量 `RANKING_RECONCILE_SEC` 控制）从 blog 库
-**全量**重新计算四个榜单并写入 ZSET。策略是**幂等**的「全量 ZADD + 移除已消失成员」：
+> **重要变更**：早期版本由 `RankingService.Reconcile` 周期性（默认 30s）从 blog 库全量重算四个榜单。
+> 该机制**已移除**——ranking 现在不连接任何业务数据库，分数完全来自业务推送。
 
-```go
-// 1) 读取聚合计数
-views[id]   = articles.view_count
-likes[id]   = articles.like_count
-comments[id]= articles.comment_count
-authorMap[uid] = COUNT(*)  // GROUP BY user_id
+三种写入方式：
 
-// 2) 全量覆盖 ZSET
-rdb.ZAdd(key, members...)                 // 覆盖所有 member 的 score
-old := rdb.ZRange(key, 0, -1)            // 取当前所有 member
-// 3) 移除 MySQL 中已不存在者（文章下线/删除、作者计数归零）
-stale := old - currentKeys
-rdb.ZRem(key, stale...)
-```
+| 场景 | 接口 | 说明 |
+|---|---|---|
+| 实时增量 | `RecordScore`（`SCORE_OP_INCREMENT`） | 业务事件发生时推送 `±delta`，等价于 `ZINCRBY` |
+| 历史回填 / 全量校正 | `BatchSetScore`（`SCORE_OP_SET`） | 覆盖绝对值，等价于 `ZADD`；`prune_others=true` 时移除快照中不存在的旧成员 |
+| 榜单声明 | `RegisterBoard` | 声明展示方式（装饰器）与跳转模板 |
 
-- **启动即执行一次全量**，避免冷启动榜单为空。
-- **幂等、可重复执行**：多次 reconcile 结果一致；reconcile 间隔内 ZSET 与 MySQL 对齐，对排行榜场景即「实时」。
-- 间隔可调小（如 5s）以获得更细的实时粒度；真正的「写入即推送」零延迟方案见 §6。
+- article-service 启动时做**一次历史回填**（含作者榜），运行中推送浏览/点赞增量；
+  comment-service 运行中推送评论增量。
+- 展示信息（标题、用户名、头像等）**不落 ranking**，由读路径的 remote 装饰实时回调业务服务获取，
+  因此业务方数据变更（如改用户名）立即生效，无需对账。
+- 环境变量 `RANKING_RECONCILE_SEC` 与配置中的 `database` 段均为**历史遗留，当前代码已不再使用**。
 
 ---
 
-## 4. 读路径：ZSET 取 TopN + 一次 DB 回填
+## 4. 读路径：ZSET 取 TopN + remote 装饰
 
-读接口从 ZSET 取 TopN（含 score），再用一次 `IN (...)` 查询回填展示字段，**避免逐条查 DB**：
+读接口从 ZSET 取 TopN（含 `score` 与 `rank`），再按 `BoardConfig` 回调业务服务的 Decorator 获取展示字段，最后渲染 `link`。
 
-- 文章榜：`LEFT JOIN users` 回填 `title / slug / cover_image / author_name`。
-- 作者榜：回填 `username / avatar`。
+- **ranking 不查询任何业务库**：所有展示信息来自 Decorator 回调（原 `builtin` 本地 blog 库富化已移除）。
 - `limit` 在 service 层做安全裁剪（≤0 → 10，>100 → 100）。
 
 ### 4.1 统一榜单（业务无关）：展示与跳转由业务方声明
@@ -93,7 +99,7 @@ rdb.ZRem(key, stale...)
 
 | 概念 | 作用 |
 |---|---|
-| `BoardConfig` | 某 board 的展示配置：`decorator_type`（`builtin` / `remote`）、`builtin`、`decorator_service`、`decorator_method`、`link_template`、`cache_ttl_sec` |
+| `BoardConfig` | 某 board 的展示配置：`decorator_type`（`remote`）、`decorator_service`、`decorator_method`、`link_template`、`cache_ttl_sec` |
 | `Decorator`（契约 `decorator.v0.Decorator`） | **业务服务**实现 `Decorate(members) -> map<member, Struct>`，把 ID 变成用户名/头像/标题等展示信息 |
 | `RankItem.display` | `google.protobuf.Struct`，**对 ranking-service 不透明**，只透传不解析 |
 | `RankItem.link` | 由 `link_template`（如 `/space/{member}`）渲染；**模板为空即不跳转** |
@@ -102,17 +108,18 @@ rdb.ZRem(key, stale...)
 GetRanking(board, limit)
   ├─ ZREVRANGE 取 TopN（member + score + rank）
   ├─ 按 BoardConfig 装饰：
-  │     builtin → 本地 blog 库富化（articles / authors），不产生跨服务调用
   │     remote  → consul 解析 decorator_service，回调 decorator.v0.Decorator
+  │     非 remote / 未配置 → 空 display（仅 member + score）
   └─ 渲染 link（替换 {member} 占位符）
 ```
 
-**两种装饰方式**
+**装饰方式（仅 `remote`）**
 
 | 类型 | 适用场景 | 说明 |
 |---|---|---|
-| `builtin` | ranking-service 自己 reconcile 的榜单（文章榜、作者榜） | 复用现有 `EnrichArticles` / `EnrichAuthors` 本地富化，零网络开销 |
-| `remote` | 业务拥有的榜单（粉丝榜、积分榜…） | 回调业务服务 `Decorate`，展示数据**实时来自属主服务**（用户名改了立即生效，优于本地快照） |
+| `remote` | 所有榜单（文章榜、作者榜，以及未来的粉丝榜/积分榜） | 回调业务服务 `Decorate`，展示数据**实时来自属主服务**（用户名改了立即生效，优于本地快照） |
+
+> `decorator_type` 非 `remote` 或未配置装饰器时，退化为「纯 `member + score`」（如积分榜只需 ID 与分数），仍可正常使用。
 
 **设计要点**
 
@@ -120,7 +127,6 @@ GetRanking(board, limit)
 - 配置持久化于 Redis（`ranking:board:config:<board>`），**动态生效，无需重启/重新部署** ranking-service。
 - 装饰结果按 board 缓存（`cache_ttl_sec`，默认 30s），降低对业务服务的读压力。
 - **优雅降级**：remote 装饰失败（服务不可达 / 超时 / 熔断）只丢展示信息，`member / score / rank` 仍正常返回，**不影响榜单主流程**。
-- 未注册的 board 退化为「纯 `member + score`」（如积分榜只需 ID 与分数），仍可正常使用。
 
 ---
 
@@ -150,15 +156,25 @@ GetRanking(board, limit)
   安全性完全依赖网络隔离（gRPC 端口仅对内网开放、不暴露公网）。因此内网任意能连到该端口的
   负载都可读写榜单——部署时必须确保 ranking 的 gRPC 端口不挂公网 LB、不被跨租户 / 不受信网络访问。
   操作类型：`SCORE_OP_INCREMENT`（ZINCRBY）/ `SCORE_OP_SET`（ZADD 绝对值）。
+- 对外 HTTP 接口文档见 [api.md](./api.md)。
 
 ---
 
-## 6. 扩展性与「写入即推送」集成点
+## 6. 扩展性与已落地的接入模式
 
-通用 `RecordScore(board, member, delta, op)` 已为**未来榜单（积分榜 / 粉丝榜）预留**，新榜只需在拥有方调用推送：
+通用 `RecordScore(board, member, delta, op)` 是接入任意新榜单的**唯一入口**。该模式**已落地**——
+当前已接入的四个榜单（浏览/点赞/评论/作者）全部由业务服务按此方式接入，ranking 核心代码未做任何榜单相关改动。
 
 - 积分榜：`article/comment/user` 在用户获得积分时 `RecordScore("board:user:points", userId, +delta, INCREMENT)`。
 - 粉丝榜：`user` 在 Follow/Unfollow 时 `RecordScore("board:author:followers", authorId, +1/-1, INCREMENT)`。
+
+### 已接入榜单的来源现状
+
+| 服务 | 职责 |
+|---|---|
+| article-service | 启动时 `RegisterBoard` 注册浏览/点赞/评论三榜（装饰器 = `article-service`）；做一次历史回填（含作者榜）；运行中推送浏览/点赞增量 |
+| comment-service | 运行中推送评论增量（评论数实际由它直接写 `articles.comment_count`） |
+| user-service | 注册作者榜（装饰器 = `user-service`）；分数 = article-service 推送的已发布文章计数 |
 
 ### 接入新榜单的完整步骤（以粉丝榜为例）
 
@@ -169,7 +185,7 @@ GetRanking(board, limit)
 2. **实现装饰**（一次性）：业务服务实现共享契约 `decorator.v0.Decorator`，把 member（用户 ID）转为展示信息。
    user-service 已提供参考实现（`internal/handler/v1/decorator_handler.go`，返回 `username / nickname / avatar`），
    启动时通过 `RegisterDecoratorServer` 注册到同一 gRPC Server（与 `UserService` 共存）。
-3. **声明展示与跳转**（一次性）：
+3. **声明展示与跳转**（一次性，经内网 gRPC）：
 
 ```json
 {
@@ -182,26 +198,28 @@ GetRanking(board, limit)
 }
 ```
 
-调用 `POST /api/v1/ranking/register_board`（仅管理员）写入，**即刻生效、无需重启**。
+调用 `RegisterBoard` 写入，**即刻生效、无需重启**。注意该接口属 `ranking.v0`（内网 gRPC），
+**不经公网网关**，由业务服务直接调用（参见 `article-service/internal/client/ranking.go` 的封装）。
 
 4. **前端消费**：`GET /api/v1/ranking/get_ranking?board=board:user:fans&limit=10` 返回
    `{member, score, rank, display:{username, avatar}, link:"/space/42"}`，前端直接渲染 `display` 并用 `link` 跳转。
 
-> 全过程**无需修改 ranking-service 任何代码**。内置榜单（文章/作者）的配置在启动时由 `seedBuiltinBoards`
-> 预置，`board:user:fans` 亦作为 `remote` 装饰示例预置。
+> 全过程**无需修改 ranking-service 任何代码**。
 
-### 接入「写入即推送」（零延迟实时）
-当前实时性由 reconcile 间隔保证；要做到 article/comment 变更时**立刻** `ZINCRBY`，需在对应服务里
-调用本服务 `RecordScore`。因 blog-ranking 需作为独立 module 发布 tag 后，才能被其它服务 `require`
-（仓库既定 tag 工作流，禁止 replace），故采用「reconcile 实时 + 预留推送 API」落地。接入步骤：
+### 业务服务如何调用摄入接口
 
-1. 发布 `github.com/mysunshines/blog-ranking` 新 tag（如 `v1.0.0`）。
-2. 在 `article-service` / `comment-service` 的 `go.mod` 增加 `require github.com/mysunshines/blog-ranking v1.0.0`，并 `go mod tidy`。
-3. 用 `grpcclient.New` 复用 gocommon 的连接池，调用 `v0pb.NewRankingServiceClient(conn).RecordScore(...)`（注意摄入接口位于 `ranking.v0.RankingService`，仅内网可达）：
-   - 文章浏览：`IncrementViewCount` flush / `PublishArticle` → `RecordScore(views, articleId, +1, INCREMENT)`
-   - 文章点赞：`LikeArticle` / `CancelLike` → `RecordScore(likes, articleId, +1/-1, INCREMENT)`
-   - 评论变更：`comment` 新增/删除 → `RecordScore(comments, articleId, +1/-1, INCREMENT)`
-   - 以上调用失败**不影响主流程**（fire-and-forget 或带重试），榜单兜底仍由 reconcile 修正。
+业务服务通过 gocommon 的连接池 + proto 生成的 `FullMethodName` 调用，无需感知 ranking 的传输细节：
+
+```go
+grpcclient.SendRequest(ctx, v0pb.RankingService_RecordScore_FullMethodName,
+    &pb.RecordScoreRequest{Board: board, Member: member, Op: pb.ScoreOp_SCORE_OP_INCREMENT, Delta: 1},
+    &resp)
+```
+
+- 调用失败**不影响主流程**（best-effort，带重试或告警），榜单分数可随时用 `BatchSetScore` 重新回填校正。
+- 依赖方式：按仓库既定 tag 工作流（`blog-ranking` 已发布 `v1.0.0`），应
+  `require github.com/mysunshines/blog-ranking v1.0.0`；当前 article/comment/user 的 `go.mod` 为便于联调
+  使用本地 `replace ... => ../ranking-service`，正式发布前应切换为 tag 引用（仓库约定禁止 replace）。
 
 ---
 
@@ -211,14 +229,14 @@ GetRanking(board, limit)
 
 | 参数 | 类型 | 含义 |
 |---|---|---|
-| `board` | string | **榜单标识**。逻辑名形如 `board:article:views`，service 层经 `cache.GetKey` 自动拼接前缀 `ranking:` 得到最终 ZSET 键 `ranking:board:article:views`。内置四个榜单名由 `constants` 定义；扩展榜单一律由调用方约定同名字符串（如 `board:user:points`、`board:author:followers`），**保持与读路径 `GetRanking/GetRank/GetScore` 传入的 `board` 完全一致**即可。 |
+| `board` | string | **榜单标识**。逻辑名形如 `board:article:views`，service 层经 `cache.GetKey` 自动拼接前缀 `ranking:` 得到最终 ZSET 键 `ranking:board:article:views`。已接入的四个榜单名由业务方约定；扩展榜单一律由调用方约定同名字符串（如 `board:user:points`、`board:author:followers`），**保持与读路径 `GetRanking/GetRank/GetScore` 传入的 `board` 完全一致**即可。 |
 | `member` | string | **榜单成员（业务主键字符串）**。即 ZSET 中的元素，必须是**唯一**的 ID 字符串：文章榜传 `strconv.FormatUint(articleId,10)`，作者/用户榜传 `strconv.FormatUint(userId,10)`。同一 `board` 内 `member` 不可重复（重复会覆盖 score）。 |
 | `delta` | double | **增量值**。仅当 `op = SCORE_OP_INCREMENT` 时生效，等价于 Redis `ZINCRBY`：把该 `member` 的 score 加 `delta`（可为负，表示减分，如取消点赞 `-1`）。`SET` 模式下被忽略。 |
 | `score` | double | **绝对值**。仅当 `op = SCORE_OP_SET` 时生效，等价于 Redis `ZADD`：把该 `member` 的 score **覆盖**为 `score`（适用于全量重算、断点续算或校正）。`INCREMENT` 模式下被忽略。 |
 | `op` | ScoreOp 枚举 | **操作类型**：`SCORE_OP_INCREMENT = 1` → 用 `delta` 做增量；`SCORE_OP_SET = 2` → 用 `score` 设绝对值；`SCORE_OP_UNSPECIFIED(0)` / 其它 → 接口返回 `invalid op`。 |
 
 > 约定：连续计数变更（点赞、评论、积分、粉丝）一律走 `INCREMENT` 的 `±delta`，幂等且可重试；
-> 批量重算或纠正类场景（首次从 MySQL 同步、reconcile 兜底）走 `SET` 的绝对值。
+> 批量重算或纠正类场景（首次从业务库同步、历史回填）走 `SET` 的绝对值。
 > 返回 `score` 字段为操作后的最新分数，便于调用方校验。
 
 ---
@@ -252,12 +270,12 @@ Redis 按 `score`（浮点 double）**自动排序并去重（member 唯一）**
 | 查单个分数 | `ZSCORE` | O(1) | 实时看「我多少分」 |
 
 对比 MySQL `ORDER BY view_count DESC LIMIT 10`：大表下需**全表扫描 + 排序**，随数据量增长显著变慢；
-ZSET 把排序成本前移到写入 / reconcile 阶段，读路径恒定 O(log N)，天然支撑高并发排行榜。
+ZSET 把排序成本前移到写入阶段，读路径恒定 O(log N)，天然支撑高并发排行榜。
 
 ### member 中的 score 与「实时性」的关系
 - `score` 就是排名的唯一依据——它越大，名次越靠前。
-- 内置榜单的 `score` 来自 blog 库计数，经 reconcile（默认 30s）刷新到 ZSET；
-- 扩展榜单的 `score` 来自调用方 `RecordScore` 推送（`INCREMENT/SET`）。
+- 已接入榜单的 `score` 来自业务服务推送（article/comment/user 在事件发生时 `RecordScore`），写入即生效；
+- 扩展榜单的 `score` 同样来自调用方 `RecordScore` 推送（`INCREMENT/SET`）。
 - 两者写入的都只是 `ZSET`，读路径无差别，所以新增任意榜单**零改读逻辑**，这正是独立 ranking-service 易扩展的根因。
 
 ---
@@ -271,11 +289,14 @@ ZSET 把排序成本前移到写入 / reconcile 阶段，读路径恒定 O(log N
 | Metrics（Prometheus 抓取） | 9097 |
 
 - 配置：`config/config.yaml`（开发）、`config/config_test.yaml`（Docker test）、`config/config_production.yaml`（生产）。
-- 关键配置项：`database`（共享 blog 库，只读）、`redis`（键前缀 `ranking:`）、`jwt.secret`、`consul.address`。
-- 环境变量 `RANKING_RECONCILE_SEC` 控制对账间隔（默认 30）；`APP_ENV` 选择配置文件。
-  注：`RANKING_INGEST_TOKEN` 曾用于摄入接口的受信服务令牌鉴权，现已**废弃并移除**：摄入接口改为完全信任内网、
-  不做应用层鉴权，业务服务（`article/comment/user`）的 `internal/client/ranking.go` 也不再向 ranking 发送该令牌。
-  部署配置中若仍保留该环境变量可直接删除。
+- 关键配置项：`redis`（键前缀 `ranking:`，**榜单状态的唯一存储**）、`jwt.secret`、`consul.address`、`app.name`。
+- 环境变量：`APP_ENV` 选择配置文件。
+- **已废弃/未使用的遗留项**：
+  - `RANKING_RECONCILE_SEC`：reconcile 机制已移除，该变量不再生效。
+  - 配置中的 `database` 段：ranking 不连接任何业务库，该段不再使用（保留仅为配置结构兼容）。
+  - `RANKING_INGEST_TOKEN`：曾用于摄入接口的受信服务令牌鉴权，现已**废弃并移除**——摄入接口改为完全信任内网、
+    不做应用层鉴权，业务服务（`article/comment/user`）的 `internal/client/ranking.go` 也不再向 ranking 发送该令牌。
+    部署配置中若仍保留该环境变量可直接删除。
 
 ```bash
 # 本地构建运行
@@ -294,18 +315,20 @@ make build-ranking          # 等价 build-ranking-service
 
 ```
 ranking-service/
-├── cmd/server/main.go          # 装配、Consul 注册、gRPC 反射、reconcile 定时循环
+├── cmd/server/main.go          # 装配、Consul 注册、gRPC 反射（v1 读接口 + v0 摄入接口）
 ├── config/                     # 三套环境配置
 ├── proto/ranking.proto         # 对外读接口契约（源真相）：ranking.v1.RankingService
-├── proto/ranking_ingest.proto   # 内部摄入接口契约：ranking.v0.RankingService（仅内网）
+├── proto/ranking_ingest.proto  # 内部摄入接口契约：ranking.v0.RankingService（仅内网）
 ├── proto/decorator/v0/         # 共享装饰契约 decorator.v0.Decorator（业务服务实现，ranking 调用）
 ├── internal/
-│   ├── constants/              # 服务名、Redis 键前缀、四个榜单键
-│   ├── model/                  # 聚合计数与回填结构体（gorm tag）
-│   ├── repository/             # 只读 blog 库：加载计数、IN 回填文章/作者
+│   ├── constants/              # Redis 键前缀、榜单展示缓存键、占位符
 │   ├── boardconfig/            # 榜单展示配置存储（Redis，动态生效）
 │   ├── decorator/              # 装饰客户端：consul 解析 + gRPC 回调业务服务
-│   ├── service/                # 核心：reconcile 重建 ZSET + 读路径聚合 + GetRanking
-│   └── handler/v1/             # gRPC 适配器（含 requireGRPCAdmin 鉴权）
+│   ├── service/                # 核心：分数摄入 + 读路径聚合 + GetRanking
+│   ├── handler/v1/             # 对外读接口 gRPC 适配器（ranking.v1）
+│   └── handler/v0/             # 内部摄入接口 gRPC 适配器（ranking.v0，仅内网）
 ├── Dockerfile / Makefile / go.mod
 ```
+
+> `internal/model`、`internal/repository` 为早期「从 blog 库 reconcile」实现的残留，
+> 当前已无任何引用（ranking 不连接业务库），后续可作为死代码清理。
